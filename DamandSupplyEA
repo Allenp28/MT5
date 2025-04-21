@@ -1,0 +1,189 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: DemandSupplyMACD_EA.mq5                          |
+//| Strategy: Uses Demand/Supply Zones, MACD, MA, BB, RSI, ATR, Candles |
+//+------------------------------------------------------------------+
+
+#define ZONE_LOOKBACK 100
+#define ZONE_WIDTH 10
+
+input int MA_Period = 50;
+input int BB_Period = 20;
+input int MACD_FastEMA = 12;
+input int MACD_SlowEMA = 26;
+input int MACD_SignalSMA = 9;
+input int RSI_Period = 14;
+input int ATR_Period = 14;
+input double LotSize = 0.1;
+input double StopLossPips = 50;
+input int MaxTrades = 3;
+input bool UseStopOrders = true;
+
+int trades_open = 0;
+
+struct Zone {
+   double high;
+   double low;
+   datetime time;
+};
+
+Zone demandZones[];
+Zone supplyZones[];
+
+//+------------------------------------------------------------------+
+bool isBullishEngulfing() {
+   return (iClose(_Symbol, PERIOD_CURRENT, 1) > iOpen(_Symbol, PERIOD_CURRENT, 1) &&
+           iClose(_Symbol, PERIOD_CURRENT, 2) < iOpen(_Symbol, PERIOD_CURRENT, 2) &&
+           iOpen(_Symbol, PERIOD_CURRENT, 1) < iClose(_Symbol, PERIOD_CURRENT, 2) &&
+           iClose(_Symbol, PERIOD_CURRENT, 1) > iOpen(_Symbol, PERIOD_CURRENT, 2));
+}
+
+bool isBearishEngulfing() {
+   return (iClose(_Symbol, PERIOD_CURRENT, 1) < iOpen(_Symbol, PERIOD_CURRENT, 1) &&
+           iClose(_Symbol, PERIOD_CURRENT, 2) > iOpen(_Symbol, PERIOD_CURRENT, 2) &&
+           iOpen(_Symbol, PERIOD_CURRENT, 1) > iClose(_Symbol, PERIOD_CURRENT, 2) &&
+           iClose(_Symbol, PERIOD_CURRENT, 1) < iOpen(_Symbol, PERIOD_CURRENT, 2));
+}
+
+bool isUptrend() {
+   double ma_current = iMA(_Symbol, PERIOD_M1, MA_Period, 0, MODE_SMA, PRICE_OPEN, 0); // Corrected iMA parameters
+   double ma_previous = iMA(_Symbol, PERIOD_M1, MA_Period, 0, MODE_SMA, PRICE_OPEN, 1);
+   return ma_current > ma_previous;
+}
+
+bool isDowntrend() {
+   double ma_current = iMA(_Symbol, PERIOD_M1, MA_Period, 0, MODE_SMA, PRICE_CLOSE, 0); // Corrected iMA parameters
+   double ma_previous = iMA(_Symbol, PERIOD_M1, MA_Period, 0, MODE_SMA, PRICE_CLOSE, 1);
+   return ma_current < ma_previous;
+}
+
+void DetectZones() {
+   ArrayResize(demandZones, 0);
+   ArrayResize(supplyZones, 0);
+
+   for (int i = ZONE_LOOKBACK; i > ZONE_WIDTH; i--) {
+      double high = iHigh(_Symbol, PERIOD_CURRENT, i);
+      double low = iLow(_Symbol, PERIOD_CURRENT, i);
+      double body = MathAbs(iClose(_Symbol, PERIOD_CURRENT, i) - iOpen(_Symbol, PERIOD_CURRENT, i));
+      double range = high - low;
+
+      if (iClose(_Symbol, PERIOD_CURRENT, i) > iOpen(_Symbol, PERIOD_CURRENT, i) &&
+          body / range > 0.6 &&
+          iClose(_Symbol, PERIOD_CURRENT, i) > iHigh(_Symbol, PERIOD_CURRENT, i + 1)) {
+         Zone z = {iOpen(_Symbol, PERIOD_CURRENT, i), low, iTime(_Symbol, PERIOD_CURRENT, i)};
+         ArrayResize(demandZones, ArraySize(demandZones) + 1);
+         demandZones[ArraySize(demandZones) - 1] = z;
+      }
+
+      if (iClose(_Symbol, PERIOD_CURRENT, i) < iOpen(_Symbol, PERIOD_CURRENT, i) &&
+          body / range > 0.6 &&
+          iClose(_Symbol, PERIOD_CURRENT, i) < iLow(_Symbol, PERIOD_CURRENT, i + 1)) {
+         Zone z = {high, iOpen(_Symbol, PERIOD_CURRENT, i), iTime(_Symbol, PERIOD_CURRENT, i)};
+         ArrayResize(supplyZones, ArraySize(supplyZones) + 1);
+         supplyZones[ArraySize(supplyZones) - 1] = z;
+      }
+   }
+}
+
+void DrawZones() {
+   for (int i = 0; i < ArraySize(demandZones); i++) {
+      string name = "DemandZone_" + IntegerToString(i);
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, demandZones[i].time, demandZones[i].low, TimeCurrent(), demandZones[i].high);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrAqua);
+   }
+
+   for (int i = 0; i < ArraySize(supplyZones); i++) {
+      string name = "SupplyZone_" + IntegerToString(i);
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, supplyZones[i].time, supplyZones[i].high, TimeCurrent(), supplyZones[i].low);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrTomato);
+   }
+}
+
+void openOrder(int orderType, double price, double sl, double tp) {
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+
+   request.symbol = _Symbol;
+   request.volume = LotSize;
+   request.type = (ENUM_ORDER_TYPE)orderType;
+   request.price = price;
+   request.sl = sl;
+   request.tp = tp;
+   request.deviation = 10;
+   request.magic = 123456;
+   request.type_filling = ORDER_FILLING_FOK;
+
+   if (OrderSend(request, result)) {
+      trades_open++;
+      Print("Trade opened: ", result.order);
+   } else {
+      Print("Trade failed: ", result.retcode);
+   }
+}
+
+void checkForTrade() {
+   double macd_main[], macd_signal[], upperBB[], lowerBB[], rsi[], atr[];
+   double price = iClose(_Symbol, PERIOD_CURRENT, 0);
+   bool nearDemand = false, nearSupply = false;
+
+   int macdHandle = iMACD(_Symbol, PERIOD_CURRENT, MACD_FastEMA, MACD_SlowEMA, MACD_SignalSMA, PRICE_CLOSE);
+   int bbHandle = iBands(_Symbol, PERIOD_CURRENT, BB_Period, 2, 0, PRICE_CLOSE);
+   int rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+   int atrHandle = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
+
+   if (CopyBuffer(macdHandle, 0, 0, 1, macd_main) < 0 ||
+       CopyBuffer(macdHandle, 1, 0, 1, macd_signal) < 0 ||
+       CopyBuffer(bbHandle, 1, 0, 1, upperBB) < 0 ||
+       CopyBuffer(bbHandle, 2, 0, 1, lowerBB) < 0 ||
+       CopyBuffer(rsiHandle, 0, 0, 1, rsi) < 0 ||
+       CopyBuffer(atrHandle, 0, 0, 1, atr) < 0)
+      return;
+
+   for (int i = 0; i < ArraySize(demandZones); i++) {
+      if (price >= demandZones[i].low && price <= demandZones[i].high)
+         nearDemand = true;
+   }
+   for (int i = 0; i < ArraySize(supplyZones); i++) {
+      if (price >= supplyZones[i].low && price <= supplyZones[i].high)
+         nearSupply = true;
+   }
+
+   double sl, tp;
+
+   if (nearDemand && isUptrend() && macd_main[0] > macd_signal[0] && isBullishEngulfing() && price <= lowerBB[0] && rsi[0] < 50) {
+      sl = price - StopLossPips * _Point;
+      tp = price + 2 * StopLossPips * _Point; // 1:2 reward ratio
+      if (trades_open < MaxTrades) {
+         int orderType = UseStopOrders ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_BUY;
+         openOrder(orderType, price, sl, tp);
+      }
+   } else if (nearSupply && isDowntrend() && macd_main[0] < macd_signal[0] && isBearishEngulfing() && price >= upperBB[0] && rsi[0] > 50) {
+      sl = price + StopLossPips * _Point;
+      tp = price - 2 * StopLossPips * _Point; // 1:2 reward ratio
+      if (trades_open < MaxTrades) {
+         int orderType = UseStopOrders ? ORDER_TYPE_SELL_STOP : ORDER_TYPE_SELL;
+         openOrder(orderType, price, sl, tp);
+      }
+   }
+
+   IndicatorRelease(macdHandle);
+   IndicatorRelease(bbHandle);
+   IndicatorRelease(rsiHandle);
+   IndicatorRelease(atrHandle);
+}
+
+int OnInit() {
+   DetectZones();
+   DrawZones();
+   checkForTrade();
+   return INIT_SUCCEEDED;
+}
+
+void OnTick() {
+   static int counter = 0;
+   if (++counter > 100) {
+      DetectZones();
+      DrawZones();
+      counter = 0;
+   }
+   checkForTrade();
+}
